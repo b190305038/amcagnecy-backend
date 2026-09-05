@@ -441,34 +441,56 @@ class EmployeePunishmentSerializer(serializers.ModelSerializer):
 
 
 class EmployeeSerializer(serializers.ModelSerializer):
+    """Employee *is* the login account (core.Employee is AUTH_USER_MODEL) —
+    there's no separate accounts.User to keep in sync. `password` overrides
+    the real (hashed) model field so it's write-only and never echoed back;
+    create()/update() route it through set_password() instead of storing it
+    as plain text."""
+
     age = serializers.ReadOnlyField()  # Computed property
     years_of_service = serializers.ReadOnlyField()  # Computed property
     promotions = PromotionHistorySerializer(many=True, read_only=True)  # Nested promotion history
     rewards = EmployeeRewardSerializer(many=True, read_only=True)  # Nested rewards
     punishments = EmployeePunishmentSerializer(many=True, read_only=True)  # Nested punishments
 
-    # Not a model field — Employee doesn't store credentials itself. The view
-    # uses this to create/update the linked login account (accounts.User),
-    # keyed by email. Never echoed back in a response.
     password = serializers.CharField(write_only=True, required=False, allow_blank=True, style={"input_type": "password"})
-    has_login = serializers.SerializerMethodField()
 
     class Meta:
         model = Employee
-        fields = "__all__"
+        fields = [
+            "id_no", "name", "email", "password",
+            "fathers_name", "mothers_name", "date_of_birth", "home_district", "permanent_address",
+            "designation", "branch", "status", "joining_date", "salary",
+            "promotion_history_count", "particulars_rewards", "particulars_punishment",
+            "age", "years_of_service", "is_active",
+            "created_at", "updated_at",
+            "promotions", "rewards", "punishments",
+        ]
         read_only_fields = ["promotion_history_count", "created_at", "updated_at"]
 
-    def get_has_login(self, obj):
-        from accounts.models import User
-        return bool(obj.email) and User.objects.filter(email=obj.email).exists()
-
     def validate(self, attrs):
-        # Every employee needs a login account, so both are required on
-        # create. On update they're optional — leave email/password
-        # untouched to keep the existing login as-is.
+        # Every employee needs a login, so both are required on create. On
+        # update they're optional — leave email/password untouched to keep
+        # the existing login as-is.
         if self.instance is None:
             if not attrs.get("email"):
                 raise serializers.ValidationError({"email": "Email is required."})
             if not attrs.get("password"):
                 raise serializers.ValidationError({"password": "Password is required."})
         return attrs
+
+    def create(self, validated_data):
+        password = validated_data.pop("password", None)
+        employee = Employee(**validated_data)
+        employee.set_password(password)
+        employee.save()
+        return employee
+
+    def update(self, instance, validated_data):
+        password = validated_data.pop("password", None)
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        if password:
+            instance.set_password(password)
+        instance.save()
+        return instance

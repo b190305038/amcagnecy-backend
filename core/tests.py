@@ -36,9 +36,10 @@ ROLES = {
     "admin@test.com": "Manager",
     "manager@test.com": "DSM",
     "area@test.com": "ASM",
-    "sr@test.com": "SE",
+    "sr@test.com": "FSE",
     "warehouse@test.com": "Support Staff",
     "accounts@test.com": "Administrative",
+    "hr@test.com": "HR",
 }
 
 
@@ -46,8 +47,10 @@ class BaseAPITest(APITestCase):
     @classmethod
     def setUpTestData(cls):
         for email, role in ROLES.items():
+            # `role` is a read-only property (alias for `designation`) on the
+            # merged Employee/User model — it isn't a constructor kwarg.
             User.objects.create_user(
-                email=email, password=PASSWORD, name=role, role=role
+                email=email, password=PASSWORD, name=role, designation=role
             )
 
     def as_role(self, email):
@@ -338,33 +341,49 @@ class DerivedAccessLimitTests(BaseAPITest):
         self.assertEqual(denied.status_code, status.HTTP_403_FORBIDDEN)
 
 
-class UserManagementTests(BaseAPITest):
-    def test_only_super_admin_may_create_users(self):
-        self.as_role("admin@test.com")
-        res = self.client.post(
-            "/api/auth/users/",
-            {"name": "New", "email": "new@test.com", "role": "SE",
-             "branch": "HQ", "status": "Active", "password": "secret-pass-1"},
-            format="json",
-        )
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+class EmployeeAuthTests(BaseAPITest):
+    """core.Employee is the login account itself (AUTH_USER_MODEL) — there's
+    no separate /api/auth/users/ anymore. Employee CRUD lives at
+    /api/employees/, gated to the 'hr' module: Manager (via '*') and the
+    dedicated HR role may create/edit employees; nobody else can."""
 
+    def _payload(self, **overrides):
+        payload = {
+            "id_no": "EMP-900", "name": "New", "email": "new@test.com",
+            "designation": "FSE", "joining_date": "2026-07-01",
+            "salary": 30000, "password": "secret-pass-1",
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_manager_and_hr_may_create_employees(self):
+        for email, id_no in [("admin@test.com", "EMP-901"), ("hr@test.com", "EMP-902")]:
+            with self.subTest(role=ROLES[email]):
+                self.as_role(email)
+                res = self.client.post(
+                    "/api/employees/",
+                    self._payload(id_no=id_no, email=f"{id_no}@test.com"),
+                    format="json",
+                )
+                self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+                self.assertNotIn("password", res.data)
+
+    def test_other_roles_cannot_create_employees(self):
         for email in ["manager@test.com", "sr@test.com", "accounts@test.com"]:
             with self.subTest(role=ROLES[email]):
                 self.as_role(email)
                 res = self.client.post(
-                    "/api/auth/users/",
-                    {"name": "X", "email": f"x-{email}", "role": "SE"},
+                    "/api/employees/",
+                    self._payload(id_no=f"EMP-{email[:3]}", email=f"x-{email}"),
                     format="json",
                 )
                 self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
-    def test_created_user_can_log_in_with_the_given_password(self):
+    def test_created_employee_can_log_in_with_the_given_password(self):
         self.as_role("admin@test.com")
         self.client.post(
-            "/api/auth/users/",
-            {"name": "Fresh", "email": "fresh@test.com", "role": "SE",
-             "branch": "HQ", "status": "Active", "password": "fresh-pass-99"},
+            "/api/employees/",
+            self._payload(id_no="EMP-903", email="fresh@test.com", password="fresh-pass-99"),
             format="json",
         )
         self.logout()
@@ -429,14 +448,18 @@ class SettingsTests(BaseAPITest):
                         self.client.get(f"/api/{ep}/").status_code, status.HTTP_200_OK
                     )
 
-    def test_only_super_admin_can_write_the_lists(self):
-        self.as_role("admin@test.com")
-        for ep in self.LISTS:
-            with self.subTest(endpoint=ep):
-                res = self.client.post(f"/api/{ep}/", {"name": f"New {ep}"}, format="json")
-                self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+    def test_manager_dsm_and_asm_can_write_the_lists(self):
+        # DSM/ASM get "all access without the Accounts & HR part" — Settings
+        # (master data) isn't Accounting or HR, so they're included.
+        for email in ["admin@test.com", "manager@test.com", "area@test.com"]:
+            self.as_role(email)
+            for ep in self.LISTS:
+                with self.subTest(role=ROLES[email], endpoint=ep):
+                    res = self.client.post(f"/api/{ep}/", {"name": f"New {ep} by {ROLES[email]}"}, format="json")
+                    self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
 
-        for email in ["manager@test.com", "sr@test.com", "warehouse@test.com", "accounts@test.com"]:
+    def test_other_roles_cannot_write_the_lists(self):
+        for email in ["sr@test.com", "warehouse@test.com", "accounts@test.com", "hr@test.com"]:
             self.as_role(email)
             for ep in self.LISTS:
                 with self.subTest(role=ROLES[email], endpoint=ep):
@@ -554,10 +577,10 @@ class DealerHierarchyTests(BaseAPITest):
         self.assertEqual(res.data["territory_code"], "T-001")
         self.assertEqual(res.data["ase_name"], "Md. Sharif")
 
-    def test_sales_officer_can_create_a_dealer_like_a_shop(self):
-        # Dealer reuses the "shops" module's permissions, so any role that may
-        # write shops (including SE) may also write dealers.
-        self.as_role("sr@test.com")
+    def test_dsm_can_create_a_dealer_like_a_shop(self):
+        # Dealer reuses the "shops" module's permissions; DSM has direct
+        # "shops" write under the 2026-09 "all except Accounts & HR" scope.
+        self.as_role("manager@test.com")
         res = self.client.post(
             "/api/dealers/",
             {"code": "WS00002", "name": "Sifat Enterprise", "area": "Dhaka North",
@@ -565,6 +588,18 @@ class DealerHierarchyTests(BaseAPITest):
             format="json",
         )
         self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+
+    def test_fse_cannot_create_a_dealer(self):
+        # FSE (ex-SE) is scoped down to Sales/Attendance/Visits only under
+        # the 2026-09 redesign — no direct or derived "shops" create access.
+        self.as_role("sr@test.com")
+        res = self.client.post(
+            "/api/dealers/",
+            {"code": "WS00003", "name": "Nope Enterprise", "area": "Dhaka North",
+             "territory": "Chawkbazar"},
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_support_staff_cannot_create_a_dealer(self):
         self.as_role("warehouse@test.com")
@@ -651,3 +686,102 @@ class ProductSalesReportTests(BaseAPITest):
         self.logout()
         res = self.client.get("/api/reports/product-sales/")
         self.assertEqual(res.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+class RoleScopeTests(BaseAPITest):
+    """The 2026-09 role redesign: DSM/ASM get everything except Accounting
+    and HR; ASE/FSE get only Sales/Attendance/Visits; Administrative
+    (Accounts & Finance) gets only Accounting+Payments; HR gets only
+    Employees+Attendance."""
+
+    def test_dsm_and_asm_still_post_ledger_entries_as_a_sale_side_effect(self):
+        # "Without the Accounts & HR part" removes their direct PERMS entry
+        # for "accounting" (so the Account & Finance *page* is hidden on the
+        # frontend), but posting a sale's ledger rows is an intrinsic part of
+        # completing a sale — DERIVED["accounting"] = ["sales"] still grants
+        # it, exactly like it always has for every selling role.
+        for email in ["manager@test.com", "area@test.com"]:
+            with self.subTest(role=ROLES[email]):
+                self.as_role(email)
+                res = self.client.post(
+                    "/api/ledger/",
+                    {"date": "2026-07-18", "account": "Misc", "debit": 1, "credit": 0, "type": "Asset"},
+                    format="json",
+                )
+                self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+
+    def test_dsm_and_asm_cannot_write_hr(self):
+        for email in ["manager@test.com", "area@test.com"]:
+            with self.subTest(role=ROLES[email]):
+                self.as_role(email)
+                res = self.client.post(
+                    "/api/employees/",
+                    {"id_no": "EMP-950", "name": "X", "email": f"x-{email}",
+                     "designation": "FSE", "joining_date": "2026-07-01", "password": "x"},
+                    format="json",
+                )
+                self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_ase_and_fse_are_restricted_to_sales_attendance_visits(self):
+        Product.objects.create(
+            sku="SKU-RS1", name="Restricted", category="C", brand="B",
+            unit="pc", price=Decimal("10.00"), stock=10,
+        )
+        for email in ["sr@test.com"]:  # FSE seeded; ASE behaves identically (same PERMS entry)
+            self.as_role(email)
+            denied_product = self.client.post(
+                "/api/products/",
+                {"sku": "SKU-NEW2", "name": "N", "category": "C", "brand": "B", "unit": "pc", "price": 1, "stock": 1},
+                format="json",
+            )
+            self.assertEqual(denied_product.status_code, status.HTTP_403_FORBIDDEN)
+            denied_offer = self.client.post(
+                "/api/offers/", {"id": "OFR-X", "name": "X", "type": "Discount"}, format="json"
+            )
+            self.assertEqual(denied_offer.status_code, status.HTTP_403_FORBIDDEN)
+            allowed_visit = self.client.post(
+                "/api/visits/",
+                {"date": "2026-07-18", "time": "09:00", "sr": "X", "shop": "Test Shop", "outcome": "Sale"},
+                format="json",
+            )
+            self.assertEqual(allowed_visit.status_code, status.HTTP_201_CREATED, allowed_visit.data)
+
+    def test_administrative_cannot_write_sales_or_hr(self):
+        self.as_role("accounts@test.com")
+        denied_sales = self.client.post(
+            "/api/sales/",
+            {"id": "INV-ADM", "date": "2026-07-18", "shop": "X", "sr": "X", "amount": 1, "payment": "Cash", "status": "Due"},
+            format="json",
+        )
+        self.assertEqual(denied_sales.status_code, status.HTTP_403_FORBIDDEN)
+        denied_hr = self.client.post(
+            "/api/employees/",
+            {"id_no": "EMP-951", "name": "X", "email": "x@test.com",
+             "designation": "FSE", "joining_date": "2026-07-01", "password": "x"},
+            format="json",
+        )
+        self.assertEqual(denied_hr.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_hr_cannot_write_accounting_or_sales(self):
+        self.as_role("hr@test.com")
+        denied_ledger = self.client.post(
+            "/api/ledger/",
+            {"date": "2026-07-18", "account": "Misc", "debit": 1, "credit": 0, "type": "Asset"},
+            format="json",
+        )
+        self.assertEqual(denied_ledger.status_code, status.HTTP_403_FORBIDDEN)
+        denied_sales = self.client.post(
+            "/api/sales/",
+            {"id": "INV-HR", "date": "2026-07-18", "shop": "X", "sr": "X", "amount": 1, "payment": "Cash", "status": "Due"},
+            format="json",
+        )
+        self.assertEqual(denied_sales.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_hr_can_write_attendance(self):
+        self.as_role("hr@test.com")
+        res = self.client.post(
+            "/api/attendance/",
+            {"id": "SR-HR1", "name": "X", "status": "Present", "visits": 0, "date": "2026-07-18"},
+            format="json",
+        )
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)

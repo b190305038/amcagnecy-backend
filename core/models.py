@@ -8,6 +8,7 @@ COERCE_DECIMAL_TO_STRING=False so it serializes as a JSON number.
 """
 import secrets
 
+from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
 from django.db import models
 
 MONEY = dict(max_digits=16, decimal_places=2)
@@ -622,23 +623,75 @@ class DamageRecord(models.Model):
 # ---------------------------------------------------------------------------
 # HR Module — Employee Management
 # ---------------------------------------------------------------------------
-class Employee(models.Model):
-    """Complete employee profile with personal, professional, and HR data."""
+class EmployeeManager(BaseUserManager):
+    """Mirrors Django's default UserManager, but on Employee: an id_no
+    (business employee ID) is minted automatically when one isn't supplied,
+    and a joining_date defaults to today so `createsuperuser` works without
+    prompting for every HR field."""
+
+    use_in_migrations = True
+
+    def _next_id_no(self):
+        highest = 0
+        for id_no in self.model.objects.values_list("id_no", flat=True):
+            digits = "".join(ch for ch in str(id_no) if ch.isdigit())
+            if digits:
+                highest = max(highest, int(digits))
+        return f"EMP-{highest + 1:03d}"
+
+    def _create_employee(self, email, password, **extra):
+        if not email:
+            raise ValueError("Employees must have an email address")
+        email = self.normalize_email(email)
+        from datetime import date
+
+        extra.setdefault("id_no", self._next_id_no())
+        extra.setdefault("joining_date", date.today())
+        employee = self.model(email=email, **extra)
+        employee.set_password(password)
+        employee.save(using=self._db)
+        return employee
+
+    def create_user(self, email, password=None, **extra):
+        extra.setdefault("is_staff", False)
+        extra.setdefault("is_superuser", False)
+        return self._create_employee(email, password, **extra)
+
+    def create_superuser(self, email, password=None, **extra):
+        extra.setdefault("is_staff", True)
+        extra.setdefault("is_superuser", True)
+        extra.setdefault("designation", "Manager")
+        if extra.get("is_staff") is not True:
+            raise ValueError("Superuser must have is_staff=True.")
+        if extra.get("is_superuser") is not True:
+            raise ValueError("Superuser must have is_superuser=True.")
+        return self._create_employee(email, password, **extra)
+
+
+class Employee(AbstractBaseUser, PermissionsMixin):
+    """Complete employee profile — and the login account itself.
+
+    There is no separate accounts.User table: this model *is*
+    settings.AUTH_USER_MODEL. `designation` is both the job title and the
+    system access role (see accounts/permissions.py, src/lib/auth.tsx);
+    `id_no` is both the business employee ID and the Django primary key.
+    """
 
     DESIGNATION_CHOICES = [
         ("Manager", "Manager"),
         ("DSM", "Divisional Sales Manager"),
         ("ASM", "Area Sales Manager"),
         ("ASE", "Area Sales Executive"),
-        ("SE", "Sales Executive"),
+        ("FSE", "Field Sales Executive"),
         ("Support Staff", "Support Staff"),
         ("Administrative", "Administrative"),
+        ("HR", "HR & Admin"),
     ]
 
     # Primary identification
     id_no = models.CharField(max_length=40, primary_key=True)  # e.g., EMP-001
     name = models.CharField(max_length=200)
-    email = models.EmailField(unique=True, blank=True, default="")
+    email = models.EmailField(unique=True)
 
     # Personal details
     fathers_name = models.CharField(max_length=200, blank=True, default="")
@@ -648,7 +701,9 @@ class Employee(models.Model):
     permanent_address = models.CharField(max_length=400, blank=True, default="")
 
     # Professional details
-    designation = models.CharField(max_length=50, choices=DESIGNATION_CHOICES, default="SE")
+    designation = models.CharField(max_length=50, choices=DESIGNATION_CHOICES, default="FSE")
+    branch = models.CharField(max_length=120, blank=True, default="")
+    status = models.CharField(max_length=20, default="Active")  # Active | Inactive
     joining_date = models.DateField()
     salary = models.DecimalField(**MONEY, default=0)
 
@@ -657,9 +712,19 @@ class Employee(models.Model):
     particulars_rewards = models.TextField(blank=True, default="")  # Multi-line text for rewards
     particulars_punishment = models.TextField(blank=True, default="")  # Multi-line text for punishments
 
+    # Login / access (AbstractBaseUser gives password + last_login; PermissionsMixin
+    # gives is_superuser + groups + user_permissions)
+    is_active = models.BooleanField(default=True)
+    is_staff = models.BooleanField(default=False)
+
     # Audit trail
     created_at = models.DateTimeField(auto_now_add=True, null=True)
     updated_at = models.DateTimeField(auto_now=True, null=True)
+
+    objects = EmployeeManager()
+
+    USERNAME_FIELD = "email"
+    REQUIRED_FIELDS = ["name"]
 
     class Meta:
         ordering = ["name"]
@@ -668,6 +733,12 @@ class Employee(models.Model):
 
     def __str__(self):
         return f"{self.id_no} — {self.name} ({self.designation})"
+
+    @property
+    def role(self):
+        """Alias so role-based permission code (`request.user.role`) keeps
+        working unchanged — designation *is* the system role."""
+        return self.designation
 
     @property
     def age(self):

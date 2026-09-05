@@ -655,14 +655,11 @@ def product_sales_report(request):
 # HR Module ViewSets
 # ---------------------------------------------------------------------------
 class EmployeeViewSet(ImportExportMixin, BaseViewSet):
-    """Employee CRUD also owns the employee's login account.
-
-    There is no separate "user" record to manage: Employee.email/password
-    (write-only, never returned) drive a linked accounts.User created or
-    kept in sync on every write, and Employee.designation *is* that
-    account's role (see accounts/models.py — the two vocabularies were
-    unified so there's exactly one place a job title/permission level is
-    set). Deleting an Employee removes their login too.
+    """Employee CRUD *is* login/account management — core.Employee is
+    settings.AUTH_USER_MODEL (see core/models.py), so there's no separate
+    user record to keep in sync. EmployeeSerializer.create()/update() already
+    hash the password field; the default ModelViewSet create/update/destroy
+    need no overriding here.
     """
 
     module = "hr"
@@ -673,52 +670,6 @@ class EmployeeViewSet(ImportExportMixin, BaseViewSet):
     ordering_fields = ["id_no", "name", "designation", "joining_date", "salary"]
     spec = EMPLOYEE_SPEC
     generate_id = staticmethod(next_employee_id)
-
-    def _sync_login(self, employee, password=None, previous_email=None):
-        from accounts.models import User
-
-        if not employee.email:
-            return
-        user = User.objects.filter(email=previous_email or employee.email).first()
-        if user is None:
-            user = User.objects.filter(email=employee.email).first()
-
-        if user is None:
-            if not password:
-                return  # no password supplied — nothing to create yet
-            User.objects.create_user(
-                email=employee.email,
-                password=password,
-                name=employee.name,
-                role=employee.designation,
-            )
-            return
-
-        user.email = employee.email
-        user.name = employee.name
-        user.role = employee.designation
-        if password:
-            user.set_password(password)
-        user.save()
-
-    def perform_create(self, serializer):
-        password = serializer.validated_data.pop("password", None)
-        employee = serializer.save()
-        self._sync_login(employee, password=password)
-
-    def perform_update(self, serializer):
-        previous_email = serializer.instance.email
-        password = serializer.validated_data.pop("password", None)
-        employee = serializer.save()
-        self._sync_login(employee, password=password, previous_email=previous_email)
-
-    def perform_destroy(self, instance):
-        from accounts.models import User
-
-        email = instance.email
-        instance.delete()
-        if email:
-            User.objects.filter(email=email).delete()
 
 
 class PromotionHistoryViewSet(BaseViewSet):

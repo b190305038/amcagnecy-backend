@@ -719,7 +719,7 @@ EMPLOYEE_SPEC = Spec(
         Column(
             key="designation",
             header="Designation",
-            choices=lambda: ["Manager", "DSM", "ASM", "ASE", "SE", "Support Staff", "Administrative"],
+            choices=lambda: ["Manager", "DSM", "ASM", "ASE", "FSE", "Support Staff", "Administrative", "HR"],
             required=True,
             help="Job designation.",
             sample="ASM",
@@ -758,6 +758,19 @@ EMPLOYEE_SPEC = Spec(
             header="Permanent Address",
             help="Full permanent address.",
             sample="House 42, Road 11, Banani, Dhaka",
+        ),
+        Column(
+            key="branch",
+            header="Branch",
+            help="Office/branch the employee is based at.",
+            sample="HQ",
+        ),
+        Column(
+            key="status",
+            header="Status",
+            choices=lambda: ["Active", "Inactive"],
+            help="Employment status.",
+            sample="Active",
         ),
     ],
 )

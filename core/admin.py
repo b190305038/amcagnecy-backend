@@ -1,4 +1,5 @@
 from django.contrib import admin
+from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 
 from .models import (
     Area,
@@ -150,11 +151,34 @@ class EmployeePunishmentInline(admin.TabularInline):
 
 
 @admin.register(Employee)
-class EmployeeAdmin(admin.ModelAdmin):
-    list_display = ("id_no", "name", "email", "designation", "joining_date", "salary")
-    list_filter = ("designation",)
+class EmployeeAdmin(BaseUserAdmin):
+    """Employee *is* the login account (AUTH_USER_MODEL) — built on Django's
+    own UserAdmin so password change/hashing in the admin site works, with
+    HR fields folded into the profile section."""
+
+    list_display = ("id_no", "name", "email", "designation", "branch", "status", "joining_date", "salary", "is_staff")
+    list_filter = ("designation", "branch", "status", "is_staff")
     search_fields = ("id_no", "name", "email")
+    ordering = ("name",)
     inlines = [PromotionHistoryInline, EmployeeRewardInline, EmployeePunishmentInline]
+    fieldsets = (
+        (None, {"fields": ("email", "password")}),
+        ("Profile", {"fields": (
+            "id_no", "name", "designation", "branch", "status",
+            "fathers_name", "mothers_name", "date_of_birth",
+            "home_district", "permanent_address",
+            "joining_date", "salary",
+        )}),
+        ("Permissions", {"fields": ("is_active", "is_staff", "is_superuser", "groups", "user_permissions")}),
+        ("Dates", {"fields": ("last_login", "created_at", "updated_at")}),
+    )
+    readonly_fields = ("created_at", "updated_at", "last_login")
+    add_fieldsets = (
+        (None, {
+            "classes": ("wide",),
+            "fields": ("id_no", "email", "name", "designation", "joining_date", "password1", "password2"),
+        }),
+    )
 
 
 @admin.register(PromotionHistory)

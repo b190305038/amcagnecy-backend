@@ -35,28 +35,34 @@ from rest_framework.permissions import SAFE_METHODS, BasePermission
 # ---------------------------------------------------------------------------
 # Direct capabilities - keep in sync with PERMS in src/lib/auth.tsx
 # ---------------------------------------------------------------------------
+# Every module except Accounting and HR — DSM and ASM get "all access
+# without the Accounts & HR part" (their words). "payments" is included
+# (collecting cash is a sales-floor action, not the Accounting ledger).
+_ALL_EXCEPT_ACCOUNTING_AND_HR = [
+    "products", "targets", "shops", "sales", "offers", "offer-accruals",
+    "attendance", "visits", "payments", "cashback", "settings",
+]
+
+# Area Sales Executive / Field Sales Executive: place orders, check
+# in/out, log outlet visits — nothing else. No direct Products/Shops
+# access, so no stock or pricing visibility; the stock/due/sales30d
+# side effects of completing a sale still work via DERIVED below.
+_FIELD_SALES = {"write": ["sales", "attendance", "visits"], "delete": []}
+
 PERMS = {
     "Manager": {"write": ["*"], "delete": ["*"]},
-    "DSM": {
-        "write": ["products", "shops", "sales", "payments", "offers", "targets", "visits"],
-        "delete": ["sales", "offers", "visits"],
-    },
-    "ASM": {
-        "write": ["shops", "sales", "payments", "visits", "targets"],
-        "delete": ["visits"],
-    },
-    "ASE": {
-        "write": ["shops", "sales", "payments", "visits"],
-        "delete": [],
-    },
-    "SE": {
-        "write": ["sales", "payments", "visits", "attendance", "shops"],
-        "delete": [],
-    },
+    "DSM": {"write": _ALL_EXCEPT_ACCOUNTING_AND_HR, "delete": _ALL_EXCEPT_ACCOUNTING_AND_HR},
+    "ASM": {"write": _ALL_EXCEPT_ACCOUNTING_AND_HR, "delete": _ALL_EXCEPT_ACCOUNTING_AND_HR},
+    "ASE": _FIELD_SALES,
+    "FSE": _FIELD_SALES,
     "Support Staff": {"write": ["products"], "delete": ["products"]},
-    # Collecting cash against an invoice is a different capability from raising
-    # one: Administrative may record payments but never create sales orders.
+    # Accounts & Finance: a separate login that gets ONLY the ledger +
+    # collecting payments — nothing else. (Accounts-related Reports stay
+    # reachable because Reports is a read-only module — reads are always
+    # open, see RoleModulePermission.has_permission.)
     "Administrative": {"write": ["accounting", "payments"], "delete": ["accounting"]},
+    # HR & Admin: Employee Directory + Attendance only.
+    "HR": {"write": ["hr", "attendance"], "delete": ["hr"]},
 }
 
 # ---------------------------------------------------------------------------

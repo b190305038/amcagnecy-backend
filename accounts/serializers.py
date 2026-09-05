@@ -4,44 +4,24 @@ from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 from .permissions import PERMS
 
-User = get_user_model()
-
-
-class UserSerializer(serializers.ModelSerializer):
-    """Matches the frontend `AppUser` shape: name, email, role, branch, status."""
-
-    password = serializers.CharField(write_only=True, required=False, allow_blank=True)
-
-    class Meta:
-        model = User
-        fields = ["id", "name", "email", "id_number", "role", "branch", "status", "password"]
-        read_only_fields = ["id"]
-
-    def create(self, validated_data):
-        password = validated_data.pop("password", "") or "demo123"
-        user = User(**validated_data)
-        user.set_password(password)
-        user.save()
-        return user
-
-    def update(self, instance, validated_data):
-        password = validated_data.pop("password", None)
-        for attr, value in validated_data.items():
-            setattr(instance, attr, value)
-        if password:
-            instance.set_password(password)
-        instance.save()
-        return instance
+User = get_user_model()  # core.Employee — see accounts/models.py
 
 
 class MeSerializer(serializers.ModelSerializer):
-    """The signed-in account plus a resolved permission map for the UI."""
+    """The signed-in account plus a resolved permission map for the UI.
 
+    `id_number` mirrors `id_no` under the name the frontend already expects
+    (it predates the Employee/User merge — kept so src/lib/auth.tsx and the
+    "view as" picker don't need a rename).
+    """
+
+    id_number = serializers.CharField(source="id_no", read_only=True)
+    role = serializers.ReadOnlyField()
     permissions = serializers.SerializerMethodField()
 
     class Meta:
         model = User
-        fields = ["id", "name", "email", "id_number", "role", "branch", "status", "permissions"]
+        fields = ["id_number", "name", "email", "role", "branch", "status", "permissions"]
 
     def get_permissions(self, obj):
         return PERMS.get(obj.role, {"write": [], "delete": []})

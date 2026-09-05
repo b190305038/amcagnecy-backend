@@ -16,7 +16,6 @@ from datetime import date
 from django.core.management.base import BaseCommand
 from django.db import transaction
 
-from accounts.models import User
 from core.models import Employee, EmployeePunishment, EmployeeReward, PromotionHistory
 
 DEMO_PASSWORD = "demo123"
@@ -131,9 +130,7 @@ class Command(BaseCommand):
         with transaction.atomic():
             if options["flush"]:
                 ids = [row[0] for row in EMPLOYEES]
-                emails = [row[2] for row in EMPLOYEES]
                 deleted, _ = Employee.objects.filter(id_no__in=ids).delete()
-                User.objects.filter(email__in=emails).delete()
                 self.stdout.write(self.style.WARNING(f"Flushed {deleted} existing demo HR row(s)."))
 
             employees_by_id = {}
@@ -141,35 +138,24 @@ class Command(BaseCommand):
                 id_no, name, email, father, mother, designation, dob,
                 joining_date, salary, home_district, permanent_address,
             ) in EMPLOYEES:
-                employee, created = Employee.objects.update_or_create(
-                    id_no=id_no,
-                    defaults=dict(
-                        name=name,
-                        email=email,
-                        fathers_name=father,
-                        mothers_name=mother,
-                        designation=designation,
-                        date_of_birth=dob,
-                        joining_date=joining_date,
-                        salary=salary,
-                        home_district=home_district,
-                        permanent_address=permanent_address,
-                    ),
-                )
+                employee = Employee.objects.filter(id_no=id_no).first()
+                created = employee is None
+                if employee is None:
+                    employee = Employee(id_no=id_no)
+                    employee.set_password(DEMO_PASSWORD)
+                employee.name = name
+                employee.email = email
+                employee.fathers_name = father
+                employee.mothers_name = mother
+                employee.designation = designation
+                employee.date_of_birth = dob
+                employee.joining_date = joining_date
+                employee.salary = salary
+                employee.home_district = home_district
+                employee.permanent_address = permanent_address
+                employee.branch = home_district
+                employee.save()
                 employees_by_id[id_no] = employee
-
-                user, user_created = User.objects.get_or_create(
-                    email=email,
-                    defaults=dict(name=name, role=designation, branch=home_district),
-                )
-                if user_created:
-                    user.set_password(DEMO_PASSWORD)
-                    user.save()
-                else:
-                    # Keep an existing login's role/name in sync with the employee record.
-                    user.name = name
-                    user.role = designation
-                    user.save(update_fields=["name", "role"])
 
                 verb = "Created" if created else "Updated"
                 self.stdout.write(f"{verb} employee {id_no} — {name} ({designation})")

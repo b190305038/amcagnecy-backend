@@ -4,14 +4,13 @@ from django.contrib.auth.tokens import default_token_generator
 from django.core.mail import send_mail
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
-from rest_framework import status, viewsets
-from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework import status
+from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.views import TokenObtainPairView
 
-from .permissions import RoleModulePermission
-from .serializers import LoginSerializer, MeSerializer, UserSerializer
+from .serializers import LoginSerializer, MeSerializer
 
 User = get_user_model()
 
@@ -97,30 +96,3 @@ class LoginView(TokenObtainPairView):
 def me(request):
     """Return the currently authenticated user's profile + permission map."""
     return Response(MeSerializer(request.user).data)
-
-
-class UserViewSet(viewsets.ModelViewSet):
-    """CRUD for the Users management page. `module='users'` -> superuser-only writes."""
-
-    queryset = User.objects.all().order_by("name")
-    serializer_class = UserSerializer
-    permission_classes = [RoleModulePermission]
-    module = "users"
-    search_fields = ["name", "email", "role", "branch"]
-    filterset_fields = ["role", "branch", "status"]
-    ordering_fields = ["name", "email", "role"]
-
-    @action(detail=True, methods=["post"])
-    def set_password(self, request, pk=None):
-        """Reset a user's password. Gated to the 'users' module (Manager
-        only) by RoleModulePermission, so no other role can reach it."""
-        user = self.get_object()
-        password = (request.data or {}).get("password", "")
-        if not password or len(str(password)) < 4:
-            return Response(
-                {"detail": "Password must be at least 4 characters."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        user.set_password(str(password))
-        user.save(update_fields=["password"])
-        return Response({"detail": f"Password reset for {user.email}."})
