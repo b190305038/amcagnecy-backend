@@ -562,6 +562,12 @@ class Target(models.Model):
     employee = models.ForeignKey(
         "Salesman", on_delete=models.SET_NULL, null=True, blank=True, related_name="targets"
     )
+    # Optional: scopes this campaign to one specific outlet instead of (or in
+    # addition to) the employee above — an outlet-wise target rather than a
+    # sales-team target.
+    shop = models.ForeignKey(
+        "Shop", on_delete=models.SET_NULL, null=True, blank=True, related_name="targets"
+    )
     target_value = models.DecimalField(max_digits=16, decimal_places=2)
     shop_visit_target = models.IntegerField(default=0)
     honorarium_type = models.CharField(max_length=10, choices=HONORARIUM_TYPE_CHOICES, default="Amount")
@@ -678,7 +684,13 @@ class Employee(AbstractBaseUser, PermissionsMixin):
     """
 
     DESIGNATION_CHOICES = [
-        ("Manager", "Manager"),
+        # "Manager" is the value stored and compared everywhere in code
+        # (accounts/permissions.py, this file, the frontend's PERMS/auth.tsx) —
+        # only the human-facing label changed to "Super Admin". Renaming the
+        # stored value itself would mean migrating every existing employee
+        # row and every one of those code comparisons; not worth the churn
+        # for a label change. See roleLabel() in the frontend's lib/auth.tsx.
+        ("Manager", "Super Admin"),
         ("DSM", "Divisional Sales Manager"),
         ("ASM", "Area Sales Manager"),
         ("ASE", "Area Sales Executive"),
@@ -702,6 +714,13 @@ class Employee(AbstractBaseUser, PermissionsMixin):
 
     # Professional details
     designation = models.CharField(max_length=50, choices=DESIGNATION_CHOICES, default="FSE")
+    # The reporting manager for the sales hierarchy (DSM -> ASM -> ASE/FSE).
+    # Self-referential rather than a dedicated Manager model since the
+    # manager is just another Employee row. SET_NULL so removing a manager
+    # never cascades into deleting their reports.
+    reports_to = models.ForeignKey(
+        "self", related_name="direct_reports", on_delete=models.SET_NULL, null=True, blank=True
+    )
     branch = models.CharField(max_length=120, blank=True, default="")
     status = models.CharField(max_length=20, default="Active")  # Active | Inactive
     joining_date = models.DateField()
@@ -739,6 +758,22 @@ class Employee(AbstractBaseUser, PermissionsMixin):
         """Alias so role-based permission code (`request.user.role`) keeps
         working unchanged — designation *is* the system role."""
         return self.designation
+
+    def downline(self):
+        """Every employee who reports to this one, directly or transitively
+        (DSM -> ASM -> ASE -> FSE and so on). Iterative BFS rather than a
+        recursive queryset so a stray cycle can't hang the request."""
+        result = []
+        seen = {self.id_no}
+        frontier = list(self.direct_reports.all())
+        while frontier:
+            emp = frontier.pop()
+            if emp.id_no in seen:
+                continue
+            seen.add(emp.id_no)
+            result.append(emp)
+            frontier.extend(emp.direct_reports.all())
+        return result
 
     @property
     def age(self):

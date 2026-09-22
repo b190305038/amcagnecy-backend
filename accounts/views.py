@@ -20,14 +20,18 @@ User = get_user_model()
 def password_reset_request(request):
     """Start a password reset: email the user a tokenised reset link.
 
-    Always returns a generic 200 so the endpoint can't be used to probe which
-    emails have accounts. In DEBUG the link is also returned in the response
-    body so the flow is testable without a live mail server.
+    Self-service "forgot password" is Super Admin (Manager) only — everyone
+    else's password is reset by a Super Admin directly, from HR > Employees
+    (see EmployeeSerializer.validate() in core/serializers.py). A non-Manager
+    email still gets the same generic response as an unregistered one, so
+    this endpoint can't be used to probe which emails have accounts *or*
+    which ones are Super Admins. In DEBUG the link is also returned in the
+    response body so the flow is testable without a live mail server.
     """
     email = str((request.data or {}).get("email", "")).strip()
     resp = {"detail": "If that email is registered, a reset link has been sent."}
     if email:
-        user = User.objects.filter(email__iexact=email, is_active=True).first()
+        user = User.objects.filter(email__iexact=email, is_active=True, designation="Manager").first()
         if user:
             uid = urlsafe_base64_encode(force_bytes(user.pk))
             token = default_token_generator.make_token(user)
@@ -55,7 +59,13 @@ def password_reset_request(request):
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def password_reset_confirm(request):
-    """Complete a password reset given a valid uid + token."""
+    """Complete a password reset given a valid uid + token.
+
+    Defense in depth alongside the Manager-only gate in password_reset_request
+    above: even a still-valid token from before that restriction (or one
+    somehow issued another way) can't complete a reset for a non-Manager
+    account.
+    """
     data = request.data or {}
     uid = str(data.get("uid", ""))
     token = str(data.get("token", ""))
@@ -71,6 +81,9 @@ def password_reset_confirm(request):
         pk = force_str(urlsafe_base64_decode(uid))
         user = User.objects.get(pk=pk)
     except (TypeError, ValueError, OverflowError, User.DoesNotExist):
+        user = None
+
+    if user is not None and user.role != "Manager":
         user = None
 
     if user is None or not default_token_generator.check_token(user, token):

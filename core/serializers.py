@@ -1,8 +1,9 @@
 from decimal import Decimal
 
+from django.utils import timezone
 from rest_framework import serializers
 
-from .attendance_rules import evaluate as evaluate_shift
+from .attendance_rules import LEAVE_QUOTA, evaluate as evaluate_shift, leave_eligible_from
 
 from .models import (
     AccountHead,
@@ -38,6 +39,17 @@ from .models import (
     Unit,
     Visit,
 )
+
+
+def _parse_iso_date(value):
+    """"2026-09-20" -> date(2026,9,20). None for blank/unparseable input —
+    the Attendance.date field is a plain string, not a DateField."""
+    from datetime import date as _date
+
+    try:
+        return _date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        return None
 
 
 class ProductSerializer(serializers.ModelSerializer):
@@ -80,6 +92,48 @@ class SalesOrderSerializer(serializers.ModelSerializer):
         # but never accepted from a client — otherwise anyone could set a known
         # token on someone else's invoice.
         read_only_fields = ["publicToken"]
+
+    def validate(self, attrs):
+        """Rules that apply only when a *new* order is being raised (not on
+        update, e.g. confirming delivery next day):
+
+        1. Pending employee — a newly-created login (Employee.status ==
+           "Pending", not yet activated by an Admin) may not be attributed a
+           sale, whether it's placing one for itself or someone else raising
+           one on its behalf. Applies even to Manager.
+        2. Morning cutoff — sales may only be entered from the shift start
+           time onward (CompanySettings.shiftStart). Manager is exempt.
+        3. Hierarchy — a DSM/ASM/ASE/FSE may only raise an order for
+           themselves or for an Employee in their own downline
+           (reports_to chain). Orders attributed to a name/email that isn't
+           a linked Employee login (legacy Salesman-only entries) pass
+           through unchanged — there's no hierarchy to check them against.
+        """
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        if self.instance is None and user is not None and getattr(user, "is_authenticated", False):
+            sr_email = attrs.get("srEmail", "")
+            target = Employee.objects.filter(email=sr_email).first() if sr_email else None
+            if target is not None and target.status == "Pending":
+                raise serializers.ValidationError(
+                    {"srEmail": f"{target.name} hasn't been activated yet — an Admin needs to approve them first."}
+                )
+
+            if user.role != "Manager":
+                company = CompanySettings.load()
+                now = timezone.localtime(timezone.now()).strftime("%H:%M")
+                if now < company.shiftStart:
+                    raise serializers.ValidationError(
+                        {"date": f"Sales can only be entered from {company.shiftStart} onward."}
+                    )
+
+                if sr_email and sr_email != user.email and target is not None:
+                    downline_emails = {e.email for e in user.downline()}
+                    if sr_email not in downline_emails:
+                        raise serializers.ValidationError(
+                            {"srEmail": "You may only record sales for yourself or employees who report to you."}
+                        )
+        return attrs
 
     def create(self, validated_data):
         lines = validated_data.pop("lines", [])
@@ -191,6 +245,25 @@ class AttendanceSerializer(serializers.ModelSerializer):
         attrs["status"] = status
         attrs["lateMinutes"] = late
         attrs["earlyMinutes"] = early
+
+        if status in LEAVE_QUOTA:
+            email = current("email")
+            employee = Employee.objects.filter(email=email).first() if email else None
+            leave_date = _parse_iso_date(current("date"))
+            if employee is not None and leave_date is not None:
+                eligible_from = leave_eligible_from(employee.joining_date)
+                if leave_date < eligible_from:
+                    raise serializers.ValidationError(
+                        {"status": f"{employee.name} becomes eligible for leave on {eligible_from.isoformat()} (6 months after joining)."}
+                    )
+                quota = LEAVE_QUOTA[status]
+                used = Attendance.objects.filter(
+                    email=email, status=status, date__startswith=str(leave_date.year)
+                ).exclude(pk=getattr(instance, "pk", None)).count()
+                if used >= quota:
+                    raise serializers.ValidationError(
+                        {"status": f"{employee.name} has already used all {quota} {status} day(s) for {leave_date.year}."}
+                    )
         return attrs
 
 
@@ -454,6 +527,7 @@ class EmployeeSerializer(serializers.ModelSerializer):
     punishments = EmployeePunishmentSerializer(many=True, read_only=True)  # Nested punishments
 
     password = serializers.CharField(write_only=True, required=False, allow_blank=True, style={"input_type": "password"})
+    reports_to_name = serializers.CharField(source="reports_to.name", read_only=True, default="")
 
     class Meta:
         model = Employee
@@ -461,6 +535,7 @@ class EmployeeSerializer(serializers.ModelSerializer):
             "id_no", "name", "email", "password",
             "fathers_name", "mothers_name", "date_of_birth", "home_district", "permanent_address",
             "designation", "branch", "status", "joining_date", "salary",
+            "reports_to", "reports_to_name",
             "promotion_history_count", "particulars_rewards", "particulars_punishment",
             "age", "years_of_service", "is_active",
             "created_at", "updated_at",
@@ -477,6 +552,28 @@ class EmployeeSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({"email": "Email is required."})
             if not attrs.get("password"):
                 raise serializers.ValidationError({"password": "Password is required."})
+        else:
+            request = self.context.get("request")
+            actor = getattr(request, "user", None) if request else None
+
+            # HR may onboard a new hire with a designation, but changing an
+            # *existing* employee's role afterward — a promotion, demotion,
+            # or transfer — is a Super Admin (Manager) decision, not an HR one.
+            new_designation = attrs.get("designation")
+            if new_designation and new_designation != self.instance.designation:
+                if actor is not None and actor.role != "Manager":
+                    raise serializers.ValidationError(
+                        {"designation": "Only a Super Admin (Manager) may change an employee's role/designation."}
+                    )
+
+            # Likewise, HR can add and edit employee information, but resetting
+            # an *existing* login's password is Super Admin-only. (HR still
+            # sets the initial password when onboarding a new hire, above.)
+            if attrs.get("password"):
+                if actor is not None and actor.role != "Manager":
+                    raise serializers.ValidationError(
+                        {"password": "Only a Super Admin (Manager) may change a password."}
+                    )
         return attrs
 
     def create(self, validated_data):

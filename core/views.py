@@ -671,6 +671,19 @@ class EmployeeViewSet(ImportExportMixin, BaseViewSet):
     spec = EMPLOYEE_SPEC
     generate_id = staticmethod(next_employee_id)
 
+    @action(detail=False, methods=["get"])
+    def team(self, request):
+        """Everyone who reports to the signed-in employee, directly or
+        transitively (DSM -> ASM -> ASE -> FSE). Powers the "give sales to
+        your downline" picker and the hierarchy-scoped attendance/dashboard
+        views on the frontend — read-only, open to any authenticated user."""
+        rows = [
+            {"id_no": e.id_no, "name": e.name, "email": e.email, "designation": e.designation}
+            for e in request.user.downline()
+            if e.status != "Pending"
+        ]
+        return Response(rows)
+
 
 class PromotionHistoryViewSet(BaseViewSet):
     module = "hr"

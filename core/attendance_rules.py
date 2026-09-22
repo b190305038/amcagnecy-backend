@@ -15,7 +15,33 @@ DEFAULT_SHIFT_END = "19:00"
 
 # Statuses an admin sets by hand. The shift rules never overwrite these — if
 # someone is marked Absent or on Leave, a stray check-in shouldn't undo it.
-MANUAL_STATUSES = {"Absent", "Leave", "On Field", "Holiday"}
+# "Leave" (untyped) is kept only so older rows still render/tone correctly;
+# new leave is always recorded as one of the two typed statuses below.
+MANUAL_STATUSES = {"Absent", "Leave", "Casual Leave", "Sick Leave", "On Field", "Holiday"}
+
+# Yearly entitlement per typed leave status (days/year). Enforced in
+# AttendanceSerializer.validate() — see core/serializers.py.
+LEAVE_QUOTA = {"Casual Leave": 10, "Sick Leave": 14}
+
+# An employee only starts accruing/using leave this many months after joining.
+LEAVE_ELIGIBILITY_MONTHS = 6
+
+
+def add_months(d, months):
+    """d + N months, clamping the day to the target month's length (no
+    dateutil dependency needed for this one calculation)."""
+    from calendar import monthrange
+
+    m = d.month - 1 + months
+    y = d.year + m // 12
+    m = m % 12 + 1
+    day = min(d.day, monthrange(y, m)[1])
+    return d.replace(year=y, month=m, day=day)
+
+
+def leave_eligible_from(joining_date):
+    """The date an employee becomes eligible to take leave."""
+    return add_months(joining_date, LEAVE_ELIGIBILITY_MONTHS)
 
 
 def to_minutes(hhmm: str) -> int | None:

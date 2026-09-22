@@ -35,12 +35,14 @@ from rest_framework.permissions import SAFE_METHODS, BasePermission
 # ---------------------------------------------------------------------------
 # Direct capabilities - keep in sync with PERMS in src/lib/auth.tsx
 # ---------------------------------------------------------------------------
-# Every module except Accounting and HR — DSM and ASM get "all access
-# without the Accounts & HR part" (their words). "payments" is included
-# (collecting cash is a sales-floor action, not the Accounting ledger).
+# Every module except Accounting, HR, and Settings — DSM and ASM get "all
+# access without the Accounts & HR part" (their words). "payments" is
+# included (collecting cash is a sales-floor action, not the Accounting
+# ledger). Settings is Manager-only (Super Admin) — see PERMS below, where
+# Manager keeps it via the "*" wildcard.
 _ALL_EXCEPT_ACCOUNTING_AND_HR = [
     "products", "targets", "shops", "sales", "offers", "offer-accruals",
-    "attendance", "visits", "payments", "cashback", "settings",
+    "attendance", "visits", "payments", "cashback",
 ]
 
 # Area Sales Executive / Field Sales Executive: place orders, check
