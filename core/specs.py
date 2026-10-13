@@ -289,6 +289,20 @@ SALES_ORDER_SPEC = Spec(
             sample="500",
         ),
         Column(
+            key="vatPercent",
+            header="VAT (%)",
+            kind="number",
+            help="VAT percentage applied on the gross amount.",
+            sample="15",
+        ),
+        Column(
+            key="vat",
+            header="VAT Amount (৳)",
+            kind="number",
+            help="VAT amount (gross x VAT%).",
+            sample="750",
+        ),
+        Column(
             key="stage",
             header="Stage",
             choices=lambda: ["Draft", "Confirmed", "Delivered"],

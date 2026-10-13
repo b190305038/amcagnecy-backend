@@ -13,6 +13,7 @@ from rest_framework.response import Response
 
 from accounts.permissions import RoleModulePermission
 
+from . import visibility
 from .importexport import XLSX_CONTENT_TYPE, build_csv, build_xlsx, parse_upload
 from .sales_report import build_report, build_report_xlsx
 from .specs import (
@@ -62,6 +63,7 @@ from .models import (
     Shop,
     ShopCategory,
     ShopReview,
+    StockEntry,
     Target,
     Territory,
     Unit,
@@ -76,6 +78,7 @@ from .serializers import (
     CompanySettingsSerializer,
     DamageRecordSerializer,
     DealerSerializer,
+    StockEntrySerializer,
     EmployeePunishmentSerializer,
     EmployeeRewardSerializer,
     EmployeeSerializer,
@@ -258,6 +261,9 @@ class TargetViewSet(ImportExportMixin, BaseViewSet):
     ordering_fields = ["name", "target_value", "start_date", "end_date", "status"]
     spec = TARGET_SPEC
 
+    def get_queryset(self):
+        return visibility.scope_by_employee_fk(super().get_queryset(), self.request.user, "employee")
+
 
 class ShopViewSet(ImportExportMixin, BaseViewSet):
     module = "shops"
@@ -269,6 +275,9 @@ class ShopViewSet(ImportExportMixin, BaseViewSet):
     spec = SHOP_SPEC
     generate_id = staticmethod(next_shop_code)
 
+    def get_queryset(self):
+        return visibility.scope_by_email(super().get_queryset(), self.request.user, "srEmail")
+
 
 class SalesOrderViewSet(ImportExportMixin, BaseViewSet):
     module = "sales"
@@ -278,6 +287,9 @@ class SalesOrderViewSet(ImportExportMixin, BaseViewSet):
     filterset_fields = ["shop", "sr", "srEmail", "payment", "status", "offer", "date"]
     ordering_fields = ["date", "amount", "id"]
     spec = SALES_ORDER_SPEC
+
+    def get_queryset(self):
+        return visibility.scope_by_email(super().get_queryset(), self.request.user, "srEmail")
 
 
 class OfferViewSet(ImportExportMixin, BaseViewSet):
@@ -300,6 +312,9 @@ class OfferAccrualViewSet(BaseViewSet):
     filterset_fields = ["shop", "offer", "status"]
     ordering_fields = ["shop", "accrued", "purchases"]
 
+    def get_queryset(self):
+        return visibility.scope_by_shop(super().get_queryset(), self.request.user)
+
 
 class DamageRecordViewSet(BaseViewSet):
     # Reuses the "products" module's permissions — anyone who can write
@@ -312,6 +327,16 @@ class DamageRecordViewSet(BaseViewSet):
     ordering_fields = ["date", "quantity", "loss_value"]
 
 
+class StockEntryViewSet(BaseViewSet):
+    # Mirror of DamageRecordViewSet — same module, opposite direction.
+    module = "products"
+    queryset = StockEntry.objects.all()
+    serializer_class = StockEntrySerializer
+    search_fields = ["id", "sku", "productName", "source", "note"]
+    filterset_fields = ["sku", "source", "date"]
+    ordering_fields = ["date", "quantity", "added_pcs"]
+
+
 class SalesmanViewSet(ImportExportMixin, BaseViewSet):
     module = "targets"
     queryset = Salesman.objects.all()
@@ -321,6 +346,9 @@ class SalesmanViewSet(ImportExportMixin, BaseViewSet):
     ordering_fields = ["id", "name", "target", "achieved", "commission"]
     spec = SALESMAN_SPEC
     generate_id = staticmethod(next_salesman_id)
+
+    def get_queryset(self):
+        return visibility.scope_by_name(super().get_queryset(), self.request.user, "name")
 
 
 class AttendanceViewSet(ImportExportMixin, BaseViewSet):
@@ -332,6 +360,14 @@ class AttendanceViewSet(ImportExportMixin, BaseViewSet):
     ordering_fields = ["sr_id", "name", "visits"]
     spec = ATTENDANCE_SPEC
 
+    def get_queryset(self):
+        # Manager and HR run attendance for the whole company (see hr.tsx /
+        # attendance.tsx — HR was explicitly given this earlier); everyone
+        # else gets self + their downline.
+        return visibility.scope_by_email(
+            super().get_queryset(), self.request.user, "email", full_roles={"Manager", "HR"}
+        )
+
 
 class LedgerEntryViewSet(BaseViewSet):
     module = "accounting"
@@ -340,6 +376,16 @@ class LedgerEntryViewSet(BaseViewSet):
     search_fields = ["account", "type", "ref"]
     filterset_fields = ["type", "date", "account"]
     ordering_fields = ["date", "debit", "credit"]
+
+    def get_queryset(self):
+        # The general ledger has no person field at all, and no sales-floor
+        # role has ever had any access to it (write or otherwise) — it's
+        # Manager/Administrative only, full stop, not downline-scoped.
+        qs = super().get_queryset()
+        user = self.request.user
+        if not user or not user.is_authenticated or user.role not in {"Manager", "Administrative"}:
+            return qs.none()
+        return qs
 
 
 class VisitViewSet(ImportExportMixin, BaseViewSet):
@@ -350,6 +396,10 @@ class VisitViewSet(ImportExportMixin, BaseViewSet):
     filterset_fields = ["sr", "srId", "shop", "outcome"]
     ordering_fields = ["id", "time"]
     spec = VISIT_SPEC
+
+    def get_queryset(self):
+        # Visit has no email field at all, only the SR's name — scope on that.
+        return visibility.scope_by_name(super().get_queryset(), self.request.user, "sr")
 
 
 class PaymentViewSet(ImportExportMixin, BaseViewSet):
@@ -362,6 +412,9 @@ class PaymentViewSet(ImportExportMixin, BaseViewSet):
     ordering_fields = ["date", "amount", "id"]
     spec = PAYMENT_SPEC
 
+    def get_queryset(self):
+        return visibility.scope_by_shop(super().get_queryset(), self.request.user, full_roles={"Manager", "Administrative"})
+
 
 class CashbackTxnViewSet(ImportExportMixin, BaseViewSet):
     module = "cashback"
@@ -371,6 +424,9 @@ class CashbackTxnViewSet(ImportExportMixin, BaseViewSet):
     filterset_fields = ["shop", "type", "offer", "date"]
     ordering_fields = ["date", "amount", "id"]
     spec = CASHBACK_SPEC
+
+    def get_queryset(self):
+        return visibility.scope_by_shop(super().get_queryset(), self.request.user, full_roles={"Manager", "Administrative"})
 
 
 class PayoutViewSet(BaseViewSet):
@@ -383,6 +439,9 @@ class PayoutViewSet(BaseViewSet):
     filterset_fields = ["shop", "method", "offer", "date"]
     ordering_fields = ["date", "amount", "id"]
 
+    def get_queryset(self):
+        return visibility.scope_by_shop(super().get_queryset(), self.request.user, full_roles={"Manager", "Administrative"})
+
 
 class ShopReviewViewSet(BaseViewSet):
     # Reviews attach to a customer (shop), so they ride the "shops" module: any
@@ -393,6 +452,9 @@ class ShopReviewViewSet(BaseViewSet):
     search_fields = ["shop", "sentiment", "note", "author"]
     filterset_fields = ["shop", "sentiment", "date"]
     ordering_fields = ["date", "id"]
+
+    def get_queryset(self):
+        return visibility.scope_by_shop(super().get_queryset(), self.request.user)
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +564,9 @@ class DealerViewSet(ImportExportMixin, BaseViewSet):
     spec = DEALER_SPEC
     generate_id = staticmethod(next_dealer_code)
 
+    def get_queryset(self):
+        return visibility.scope_by_employee_fk(super().get_queryset(), self.request.user, "ase")
+
 
 class CompanySettingsViewSet(SettingsViewSet):
     """Always exactly one row. The frontend treats it as a one-item collection.
@@ -586,6 +651,8 @@ def public_invoice(request, invoice_id):
                 "amount": total,
                 "gross": order.gross,
                 "discount": order.discount,
+                "vatPercent": order.vatPercent,
+                "vat": order.vat,
                 "paid": paid,
                 "due": due,
                 "payment": order.payment,
@@ -671,6 +738,16 @@ class EmployeeViewSet(ImportExportMixin, BaseViewSet):
     spec = EMPLOYEE_SPEC
     generate_id = staticmethod(next_employee_id)
 
+    # NOTE: deliberately NOT row-scoped (unlike every other ViewSet in this
+    # file) — the basic employee list (name/email/designation/reports_to) is
+    # a shared directory that pickers across the app depend on: the New
+    # Order "sales officer" field, the HR "Reports To" dropdown, attendance
+    # display names, etc. all read the full list for every signed-in user.
+    # What IS restricted is the *sensitive* HR fields on each row (salary,
+    # DOB, address, promotions/rewards/punishments) — see
+    # EmployeeSerializer.to_representation, which redacts those for anyone
+    # who isn't Manager/HR and isn't looking at their own record.
+
     @action(detail=False, methods=["get"])
     def team(self, request):
         """Everyone who reports to the signed-in employee, directly or
@@ -693,6 +770,9 @@ class PromotionHistoryViewSet(BaseViewSet):
     filterset_fields = ["employee", "promotion_type", "promotion_date"]
     ordering_fields = ["promotion_date", "employee__name"]
 
+    def get_queryset(self):
+        return visibility.scope_hr_related(super().get_queryset(), self.request.user)
+
 
 class EmployeeRewardViewSet(BaseViewSet):
     module = "hr"
@@ -702,6 +782,9 @@ class EmployeeRewardViewSet(BaseViewSet):
     filterset_fields = ["employee", "reward_type", "date"]
     ordering_fields = ["date", "employee__name"]
 
+    def get_queryset(self):
+        return visibility.scope_hr_related(super().get_queryset(), self.request.user)
+
 
 class EmployeePunishmentViewSet(BaseViewSet):
     module = "hr"
@@ -710,3 +793,6 @@ class EmployeePunishmentViewSet(BaseViewSet):
     search_fields = ["id", "employee__name", "severity", "offense"]
     filterset_fields = ["employee", "severity", "date"]
     ordering_fields = ["date", "employee__name", "severity"]
+
+    def get_queryset(self):
+        return visibility.scope_hr_related(super().get_queryset(), self.request.user)

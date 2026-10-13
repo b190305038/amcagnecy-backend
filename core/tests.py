@@ -9,9 +9,12 @@ partially-completed sale.
 
     python manage.py test
 """
+from datetime import datetime
 from decimal import Decimal
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
@@ -23,7 +26,6 @@ from core.models import (
     Payment,
     Product,
     Region,
-    Salesman,
     SalesOrder,
     Shop,
     Territory,
@@ -162,11 +164,16 @@ class SaleWorkflowTests(BaseAPITest):
         return results
 
     def test_selling_roles_complete_the_entire_workflow(self):
+        # Pinned well inside the default 10:05-19:00 shift window so this
+        # doesn't flake depending on what time of day the suite happens to
+        # run (SalesOrderSerializer rejects a new sale before shift start).
+        midday = timezone.make_aware(datetime(2026, 7, 18, 14, 0))
         for email in ["admin@test.com", "manager@test.com", "area@test.com", "sr@test.com"]:
             with self.subTest(role=ROLES[email]):
                 Product.objects.filter(sku="SKU-T1").update(stock=100)
                 self.as_role(email)
-                results = self._sell(f"INV-{email[:3].upper()}")
+                with patch("django.utils.timezone.now", return_value=midday):
+                    results = self._sell(f"INV-{email[:3].upper()}")
                 for step, res in results.items():
                     self.assertIn(
                         res.status_code,
@@ -179,7 +186,9 @@ class SaleWorkflowTests(BaseAPITest):
 
     def test_a_sale_leaves_the_ledger_balanced(self):
         self.as_role("sr@test.com")
-        self._sell("INV-BAL")
+        midday = timezone.make_aware(datetime(2026, 7, 18, 14, 0))
+        with patch("django.utils.timezone.now", return_value=midday):
+            self._sell("INV-BAL")
         rows = LedgerEntry.objects.filter(ref="INV-BAL")
         self.assertEqual(rows.count(), 2)
         debits = sum(r.debit for r in rows)
@@ -448,18 +457,18 @@ class SettingsTests(BaseAPITest):
                         self.client.get(f"/api/{ep}/").status_code, status.HTTP_200_OK
                     )
 
-    def test_manager_dsm_and_asm_can_write_the_lists(self):
-        # DSM/ASM get "all access without the Accounts & HR part" — Settings
-        # (master data) isn't Accounting or HR, so they're included.
-        for email in ["admin@test.com", "manager@test.com", "area@test.com"]:
-            self.as_role(email)
-            for ep in self.LISTS:
-                with self.subTest(role=ROLES[email], endpoint=ep):
-                    res = self.client.post(f"/api/{ep}/", {"name": f"New {ep} by {ROLES[email]}"}, format="json")
-                    self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+    def test_only_manager_can_write_the_lists(self):
+        # Settings (master data) is Super Admin-only as of the 2026-10 change
+        # that locked it down from "all except Accounts & HR" — DSM/ASM lost
+        # direct settings write then, same as everyone but Manager.
+        self.as_role("admin@test.com")
+        for ep in self.LISTS:
+            with self.subTest(endpoint=ep):
+                res = self.client.post(f"/api/{ep}/", {"name": f"New {ep} by Manager"}, format="json")
+                self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
 
     def test_other_roles_cannot_write_the_lists(self):
-        for email in ["sr@test.com", "warehouse@test.com", "accounts@test.com", "hr@test.com"]:
+        for email in ["manager@test.com", "area@test.com", "sr@test.com", "warehouse@test.com", "accounts@test.com", "hr@test.com"]:
             self.as_role(email)
             for ep in self.LISTS:
                 with self.subTest(role=ROLES[email], endpoint=ep):
@@ -561,7 +570,12 @@ class DealerHierarchyTests(BaseAPITest):
         self.region = Region.objects.create(name="Central-1")
         self.area = Area.objects.create(name="Dhaka North", code="A-01", region=self.region)
         self.territory = Territory.objects.create(name="Chawkbazar", code="T-001", area=self.area)
-        self.ase = Salesman.objects.create(id="AMC-011", name="Md. Sharif")
+        # Dealer.ase links to Employee (any HR designation, DSM/ASM/ASE/...),
+        # not the separate Salesman table.
+        self.ase = User.objects.create_user(
+            id_no="AMC-011", email="amc011@test.com", password=PASSWORD,
+            name="Md. Sharif", designation="ASE",
+        )
 
     def test_manager_can_create_a_dealer_with_the_full_hierarchy(self):
         self.as_role("admin@test.com")
@@ -628,7 +642,10 @@ class ProductSalesReportTests(BaseAPITest):
         self.region = Region.objects.create(name="Central-1")
         self.area = Area.objects.create(name="Dhaka North", code="A-01", region=self.region)
         self.territory = Territory.objects.create(name="Chawkbazar", code="T-001", area=self.area)
-        self.ase = Salesman.objects.create(id="AMC-011", name="Md. Sharif")
+        self.ase = User.objects.create_user(
+            id_no="AMC-011", email="amc011-rpt@test.com", password=PASSWORD,
+            name="Md. Sharif", designation="ASE",
+        )
         self.dealer = Dealer.objects.create(
             code="WS00001", name="Sanam Enterprise", region="Central-1",
             area="Dhaka North", territory="Chawkbazar", ase=self.ase,
@@ -785,3 +802,91 @@ class RoleScopeTests(BaseAPITest):
             format="json",
         )
         self.assertEqual(res.status_code, status.HTTP_201_CREATED, res.data)
+
+
+class RowVisibilityTests(BaseAPITest):
+    """Row-level read scoping (core/visibility.py): a role may be allowed to
+    *write* a module company-wide, but that's a different axis from whose
+    *rows* it can read back — Manager sees everything; everyone else sees
+    self + downline (DSM -> ASM -> ASE -> FSE via Employee.reports_to)."""
+
+    @classmethod
+    def setUpTestData(cls):
+        super().setUpTestData()
+        dsm = User.objects.get(email="manager@test.com")  # role DSM
+        asm = User.objects.get(email="area@test.com")  # role ASM
+        asm.reports_to = dsm
+        asm.save()
+        fse = User.objects.get(email="sr@test.com")  # role FSE
+        fse.reports_to = asm
+        fse.save()
+        # An unrelated branch: HR has no downline and reports to nobody.
+        cls.outsider_email = "hr@test.com"
+
+        Shop.objects.create(
+            code="SHP-VIS1", name="FSE Shop", category="Retail", area="A",
+            territory="T", owner="O", srEmail=fse.email, srName=fse.name,
+        )
+        Shop.objects.create(
+            code="SHP-VIS2", name="Outsider Shop", category="Retail", area="A",
+            territory="T", owner="O", srEmail=cls.outsider_email, srName="Outsider",
+        )
+
+    def _shop_codes(self):
+        res = self.client.get("/api/shops/")
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        return {s["code"] for s in res.data["results"]}
+
+    def test_manager_sees_every_shop(self):
+        self.as_role("admin@test.com")
+        codes = self._shop_codes()
+        self.assertIn("SHP-VIS1", codes)
+        self.assertIn("SHP-VIS2", codes)
+
+    def test_dsm_sees_downline_shop_not_unrelated_one(self):
+        # DSM -> ASM -> FSE: the DSM should see the FSE's shop (two levels
+        # down) but not a shop belonging to someone outside the hierarchy.
+        self.as_role("manager@test.com")
+        codes = self._shop_codes()
+        self.assertIn("SHP-VIS1", codes)
+        self.assertNotIn("SHP-VIS2", codes)
+
+    def test_fse_sees_only_its_own_shop(self):
+        self.as_role("sr@test.com")
+        codes = self._shop_codes()
+        self.assertIn("SHP-VIS1", codes)
+        self.assertNotIn("SHP-VIS2", codes)
+
+    def test_hr_data_is_redacted_for_other_roles_but_not_for_self(self):
+        User.objects.filter(email="sr@test.com").update(salary=Decimal("30000"))
+        self.as_role("sr@test.com")
+        own = self.client.get("/api/employees/").data["results"]
+        mine = next(e for e in own if e["email"] == "sr@test.com")
+        someone_else = next(e for e in own if e["email"] != "sr@test.com")
+        self.assertIn("salary", mine)
+        self.assertNotIn("salary", someone_else)
+        # The directory itself (name/email/designation) must stay visible to
+        # everyone — pickers across the app depend on the full list.
+        self.assertEqual(len(own), len(ROLES))
+
+    def test_hr_role_sees_everyones_sensitive_fields(self):
+        User.objects.filter(email="sr@test.com").update(salary=Decimal("30000"))
+        self.as_role("hr@test.com")
+        rows = self.client.get("/api/employees/").data["results"]
+        sr = next(e for e in rows if e["email"] == "sr@test.com")
+        self.assertIn("salary", sr)
+
+    def test_ledger_is_manager_and_administrative_only(self):
+        LedgerEntry.objects.create(date="2026-07-18", account="Misc", debit=1, credit=0, type="Asset")
+        for email in ["admin@test.com", "accounts@test.com"]:
+            with self.subTest(role=ROLES[email]):
+                self.as_role(email)
+                res = self.client.get("/api/ledger/")
+                self.assertEqual(res.status_code, status.HTTP_200_OK)
+                self.assertGreaterEqual(len(res.data["results"]), 1)
+        for email in ["manager@test.com", "area@test.com", "sr@test.com", "warehouse@test.com", "hr@test.com"]:
+            with self.subTest(role=ROLES[email]):
+                self.as_role(email)
+                res = self.client.get("/api/ledger/")
+                self.assertEqual(res.status_code, status.HTTP_200_OK)
+                self.assertEqual(res.data["results"], [])

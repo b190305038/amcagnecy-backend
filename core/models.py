@@ -133,6 +133,10 @@ class CompanySettings(models.Model):
     vatBin = models.CharField(max_length=60, blank=True, default="")
     invoiceFooter = models.CharField(max_length=400, blank=True, default="")
 
+    # Two images shown side by side on the sign-in screen. Blank hides them.
+    loginImage1 = models.TextField(blank=True, default="")  # data URL or image URL
+    loginImage2 = models.TextField(blank=True, default="")  # data URL or image URL
+
     # -- Attendance shift window -------------------------------------------
     # Stored as "HH:MM" 24-hour strings so they compare lexicographically the
     # same way they compare chronologically. A check-in at or before shiftStart
@@ -247,12 +251,13 @@ class Dealer(models.Model):
     region = models.CharField(max_length=120, blank=True, default="")
     area = models.CharField(max_length=120, blank=True, default="")
     territory = models.CharField(max_length=120, blank=True, default="")
-    # The Area Sales Executive covering this dealer. Reuses the Salesman
-    # record (id/name) rather than duplicating a name+code pair here, so the
-    # report always reflects whoever HR/Settings currently has assigned. The
-    # Salesman id (e.g. "SR-01") *is* the ASE code.
+    # The employee covering this dealer — any HR designation (DSM/ASM/ASE/
+    # FSE/...), not only field-sales entries in the separate Salesman table.
+    # References core.Employee (the HR directory / login account) directly,
+    # so the report always reflects whoever HR currently has assigned, and
+    # "assign a DSM/ASM" actually has someone to pick from.
     ase = models.ForeignKey(
-        "Salesman", related_name="dealers", on_delete=models.SET_NULL, null=True, blank=True
+        "Employee", related_name="dealers", on_delete=models.SET_NULL, null=True, blank=True
     )
     contact_number = models.CharField(max_length=60, blank=True, default="")
     address = models.CharField(max_length=400, blank=True, default="")
@@ -289,6 +294,11 @@ class SalesOrder(models.Model):
     # Offer calculation snapshot (so the invoice keeps its gross/discount split).
     gross = models.DecimalField(**MONEY, default=0)
     discount = models.DecimalField(**MONEY, default=0)
+    # VAT: percent applied to `gross` (before discount), plus the computed
+    # amount snapshot — stored rather than re-derived so a changed rate later
+    # doesn't alter the amount printed on an already-issued invoice.
+    vatPercent = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    vat = models.DecimalField(**MONEY, default=0)
 
     class Meta:
         ordering = ["-date", "-id"]
@@ -556,11 +566,14 @@ class Target(models.Model):
     ]
     name = models.CharField(max_length=200)
     description = models.CharField(max_length=400, blank=True, default="")
-    # Which employee this target campaign is assigned to. Nullable so existing
-    # targets created before this field don't break; new ones are required to
-    # set it from the frontend dropdown.
+    # Which employee this target campaign is assigned to — any HR designation
+    # (DSM/ASM/ASE/FSE/...), not only field-sales entries in the separate
+    # Salesman table (which most agencies never populate). References
+    # core.Employee (the HR directory / login account) directly. Nullable so
+    # existing targets created before this field don't break; new ones are
+    # required to set it from the frontend dropdown.
     employee = models.ForeignKey(
-        "Salesman", on_delete=models.SET_NULL, null=True, blank=True, related_name="targets"
+        "Employee", on_delete=models.SET_NULL, null=True, blank=True, related_name="targets"
     )
     # Optional: scopes this campaign to one specific outlet instead of (or in
     # addition to) the employee above — an outlet-wise target rather than a
@@ -624,6 +637,45 @@ class DamageRecord(models.Model):
 
     def __str__(self):
         return f"{self.id} — {self.sku} x{self.quantity} ({self.reason})"
+
+
+class StockEntry(models.Model):
+    """A restock — cartons or pieces added to a product's good stock. The
+    mirror image of DamageRecord: same shape, opposite direction. Kept
+    separate from the product's own carton/extra_pcs fields (which an edit can
+    also overwrite directly) so there's an auditable log of "who added how
+    much, when" — incrementing the product's good stock when a record is
+    created, and reversing that on edit/delete, is orchestrated client-side in
+    products.tsx exactly like DamageRecord."""
+
+    SOURCE_CHOICES = [
+        ("Purchase", "Purchase"),
+        ("Return", "Return"),
+        ("Transfer In", "Transfer In"),
+        ("Correction", "Correction"),
+        ("Other", "Other"),
+    ]
+    id = models.CharField(max_length=40, primary_key=True)  # e.g. STK-00001
+    date = models.CharField(max_length=20)  # ISO date string
+    sku = models.CharField(max_length=40)
+    productName = models.CharField(max_length=200, blank=True, default="")  # snapshot, survives product edits/deletes
+    quantity = models.IntegerField(default=0)
+    unit_type = models.CharField(max_length=10, default="PCS")  # PCS | Carton — snapshot from the product
+    source = models.CharField(max_length=20, choices=SOURCE_CHOICES, default="Purchase")
+    # Total pieces this entry added to good stock, snapshotted at entry time —
+    # same reasoning as DamageRecord.damaged_pcs: what an edit/delete reverses.
+    added_pcs = models.IntegerField(default=0)
+    pcs_per_carton = models.IntegerField(default=1)
+    note = models.CharField(max_length=400, blank=True, default="")
+    addedBy = models.CharField(max_length=200, blank=True, default="")
+    createdAt = models.DateTimeField(auto_now_add=True, null=True)
+
+    class Meta:
+        ordering = ["-date", "-id"]
+        verbose_name_plural = "stock entries"
+
+    def __str__(self):
+        return f"{self.id} — {self.sku} x{self.quantity} ({self.source})"
 
 
 # ---------------------------------------------------------------------------

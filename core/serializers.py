@@ -33,6 +33,7 @@ from .models import (
     Salesman,
     Shop,
     ShopCategory,
+    StockEntry,
     ShopReview,
     Target,
     Territory,
@@ -394,7 +395,7 @@ class DealerSerializer(serializers.ModelSerializer):
     Settings master-list entry, by name, at read time — so a code change on
     the Area/Territory list is reflected immediately without touching every
     dealer that references it. `ase_name` is resolved from the linked
-    Salesman for display; `ase` itself *is* the ASE code."""
+    Employee for display; `ase` itself *is* that employee's id_no."""
 
     ase_name = serializers.CharField(source="ase.name", read_only=True, default="")
     area_code = serializers.SerializerMethodField()
@@ -423,6 +424,7 @@ class CompanySettingsSerializer(serializers.ModelSerializer):
         fields = [
             "id", "name", "tagline", "logo", "address", "phone", "email",
             "website", "currency", "vatBin", "invoiceFooter",
+            "loginImage1", "loginImage2",
             "shiftStart", "shiftEnd",
         ]
         read_only_fields = ["id"]
@@ -492,6 +494,46 @@ class DamageRecordSerializer(serializers.ModelSerializer):
         return attrs
 
 
+class StockEntrySerializer(serializers.ModelSerializer):
+    """Validates a restock and fills in the snapshot fields — the mirror of
+    DamageRecordSerializer above, same reasoning: the client normally sends
+    the snapshots because it's also the client that credits the product's
+    good stock, but they're re-derived here whenever missing so a record
+    created straight from the API or the admin is still complete."""
+
+    class Meta:
+        model = StockEntry
+        fields = "__all__"
+
+    def validate_quantity(self, value):
+        if value is None or int(value) <= 0:
+            raise serializers.ValidationError("Restock quantity must be at least 1.")
+        return value
+
+    def validate(self, attrs):
+        data = {**getattr(self.instance, "__dict__", {}), **attrs} if self.instance else dict(attrs)
+        sku = data.get("sku")
+        product = Product.objects.filter(sku=sku).first() if sku else None
+        if sku and product is None:
+            raise serializers.ValidationError({"sku": "No product with that SKU."})
+        if product is None:
+            return attrs
+
+        unit_type = data.get("unit_type") or product.unit_type or "PCS"
+        quantity = int(data.get("quantity") or 0)
+        pcs_per_carton = int(data.get("pcs_per_carton") or 0) or max(1, product.pcs_per_carton or 1)
+        added_pcs = int(data.get("added_pcs") or 0) or (
+            quantity * pcs_per_carton if unit_type == "Carton" else quantity
+        )
+
+        if not attrs.get("productName"):
+            attrs["productName"] = product.name
+        attrs["unit_type"] = unit_type
+        attrs["pcs_per_carton"] = pcs_per_carton
+        attrs["added_pcs"] = added_pcs
+        return attrs
+
+
 # ---------------------------------------------------------------------------
 # HR Module Serializers
 # ---------------------------------------------------------------------------
@@ -542,6 +584,27 @@ class EmployeeSerializer(serializers.ModelSerializer):
             "promotions", "rewards", "punishments",
         ]
         read_only_fields = ["promotion_history_count", "created_at", "updated_at"]
+
+    #: Fields only Manager/HR (or the employee themselves) ever see. Everyone
+    #: else still needs the *rest* of this serializer — name/email/
+    #: designation/reports_to — since pickers across the app (sales officer,
+    #: Reports To, attendance display names) read the full employee list.
+    _SENSITIVE_FIELDS = [
+        "fathers_name", "mothers_name", "date_of_birth", "home_district", "permanent_address",
+        "salary", "promotion_history_count", "particulars_rewards", "particulars_punishment",
+        "promotions", "rewards", "punishments",
+    ]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request else None
+        is_self = user is not None and getattr(user, "pk", None) == instance.pk
+        if user is not None and (is_self or user.role in ("Manager", "HR")):
+            return data
+        for field in self._SENSITIVE_FIELDS:
+            data.pop(field, None)
+        return data
 
     def validate(self, attrs):
         # Every employee needs a login, so both are required on create. On

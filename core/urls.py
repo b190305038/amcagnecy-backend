@@ -31,6 +31,7 @@ from .views import (
     ShopCategoryViewSet,
     ShopReviewViewSet,
     ShopViewSet,
+    StockEntryViewSet,
     TargetViewSet,
     TerritoryViewSet,
     UnitViewSet,
@@ -55,6 +56,7 @@ router.register("cashback-txns", CashbackTxnViewSet)
 router.register("shop-reviews", ShopReviewViewSet)
 router.register("targets", TargetViewSet)
 router.register("damage-records", DamageRecordViewSet)
+router.register("stock-entries", StockEntryViewSet)
 
 # HR Module
 router.register("employees", EmployeeViewSet)
