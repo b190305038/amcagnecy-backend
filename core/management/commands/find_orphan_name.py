@@ -9,11 +9,14 @@ Dry run (lists every match, changes nothing):
 
     python manage.py find_orphan_name "Md. Sharif"
 
-Actually clear the matches (blanks srName/srEmail on Shop rows; leaves
-SalesOrder.sr/srEmail alone since those are historical invoices — real past
-sales that happened under that name, not safe to silently rewrite):
+Actually clear the matches:
 
-    python manage.py find_orphan_name "Md. Sharif" --clear-shops
+    python manage.py find_orphan_name "Md. Sharif" --clear-shops   # blanks Shop.srName/srEmail
+    python manage.py find_orphan_name "Md. Sharif" --delete-salesman   # deletes the Salesman row(s)
+
+SalesOrder.sr/srEmail is always left alone — those are historical invoices;
+if the name is confirmed fake/test data rather than a real past sale, review
+and delete those SalesOrder rows by hand (this command won't touch invoices).
 """
 from django.core.management.base import BaseCommand, CommandError
 
@@ -29,6 +32,11 @@ class Command(BaseCommand):
             "--clear-shops",
             action="store_true",
             help="Blank Shop.srName/srEmail on every matching outlet (irreversible).",
+        )
+        parser.add_argument(
+            "--delete-salesman",
+            action="store_true",
+            help="Delete every matching Salesman row outright (irreversible — only for confirmed fake/test data).",
         )
 
     def handle(self, *args, **options):
@@ -69,21 +77,33 @@ class Command(BaseCommand):
         visits = Visit.objects.filter(sr__iexact=name).count()
         self.stdout.write(f"\nVisit records logged under '{name}': {visits}")
 
+        did_something = False
+
         if options["clear_shops"]:
+            did_something = True
             if not shops:
                 self.stdout.write(self.style.SUCCESS("\nNo Shop rows to clear."))
-                return
-            for s in shops:
-                s.srName = ""
-                s.srEmail = ""
-            Shop.objects.bulk_update(shops, ["srName", "srEmail"])
-            self.stdout.write(self.style.SUCCESS(f"\nCleared srName/srEmail on {len(shops)} shop(s)."))
-        else:
+            else:
+                for s in shops:
+                    s.srName = ""
+                    s.srEmail = ""
+                Shop.objects.bulk_update(shops, ["srName", "srEmail"])
+                self.stdout.write(self.style.SUCCESS(f"\nCleared srName/srEmail on {len(shops)} shop(s)."))
+
+        if options["delete_salesman"]:
+            did_something = True
+            if not salesmen:
+                self.stdout.write(self.style.SUCCESS("\nNo Salesman rows to delete."))
+            else:
+                count, _ = Salesman.objects.filter(name__iexact=name).delete()
+                self.stdout.write(self.style.SUCCESS(f"\nDeleted {count} Salesman row(s) named '{name}'."))
+
+        if not did_something:
             self.stdout.write(
                 self.style.WARNING(
                     "\nDry run only — nothing changed. Re-run with --clear-shops to blank the "
-                    "Shop.srName/srEmail matches above (re-assign each outlet to a real employee "
-                    "afterward). SalesOrder/Visit rows are left alone on purpose — those are real "
-                    "historical records, not safe to rewrite automatically."
+                    "Shop.srName/srEmail matches above, and/or --delete-salesman to remove the "
+                    "Salesman row(s) above outright. SalesOrder/Visit rows are always left alone — "
+                    "review and delete those by hand if the name is confirmed fake data."
                 )
             )
