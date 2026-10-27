@@ -92,7 +92,12 @@ DERIVED = {
 
 # Fields a role may touch when its access is *only* derived.
 FIELD_LIMITS = {
-    "products": {"stock"},
+    # A sale (or a Confirm-Delivery quantity edit) must keep BOTH the flat
+    # `stock` mirror AND whichever of cartons/pieces/extra_pcs is the real
+    # bucket for that product in step — the Products & Stock page reads
+    # cartons/pieces, not `stock`, so patching `stock` alone (the old
+    # behaviour) silently let it drift from what that page shows.
+    "products": {"stock", "cartons", "pieces", "extra_pcs"},
     "shops": {"due", "sales30d", "credit"},
     "sales": {"paid", "due", "status"},
 }
