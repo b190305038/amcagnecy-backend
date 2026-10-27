@@ -1,10 +1,12 @@
 import secrets
+from collections import defaultdict
 from datetime import date
 from decimal import Decimal
 
 from django.db import transaction
 from django.db.models import ProtectedError
 from django.http import HttpResponse
+from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.parsers import FormParser, MultiPartParser
@@ -264,6 +266,64 @@ class TargetViewSet(ImportExportMixin, BaseViewSet):
     def get_queryset(self):
         return visibility.scope_by_employee_fk(super().get_queryset(), self.request.user, "employee")
 
+    @action(detail=False, methods=["get"], url_path="team-summary")
+    def team_summary(self, request):
+        """Hierarchical target roll-up: ASE/FSE/SO targets add up into their
+        ASM's team total, and every ASM's team total adds up into their
+        DSM's divisional total — automatically, from the reports_to tree,
+        not a separately-maintained figure. Only Active targets count.
+        Returns one row per person in the signed-in user's downline (plus
+        themselves) so the frontend can show a team total at any level
+        without re-deriving the tree itself.
+
+        `own_*` is what's assigned directly to that person; `team_*` is
+        that plus their entire downline, recursively. This is ASSIGNED
+        target only — actual sales achievement is a completely separate
+        figure (SalesOrder/dashboard), never merged into this number.
+        """
+        user = request.user
+        people = [user] + list(user.downline())
+        id_set = {e.id_no for e in people}
+
+        direct_totals: dict[str, dict] = defaultdict(lambda: {"target_value": Decimal("0"), "shop_visit_target": 0})
+        targets = Target.objects.filter(employee_id__in=id_set, status="Active").values(
+            "employee_id", "target_value", "shop_visit_target"
+        )
+        for t in targets:
+            bucket = direct_totals[t["employee_id"]]
+            bucket["target_value"] += t["target_value"] or Decimal("0")
+            bucket["shop_visit_target"] += t["shop_visit_target"] or 0
+
+        children: dict[str, list] = defaultdict(list)
+        for e in people:
+            if e.reports_to_id and e.reports_to_id in id_set:
+                children[e.reports_to_id].append(e.id_no)
+
+        memo: dict[str, dict] = {}
+
+        def rollup(id_no):
+            if id_no in memo:
+                return memo[id_no]
+            total = dict(direct_totals[id_no])
+            for child_id in children.get(id_no, []):
+                child_total = rollup(child_id)
+                total["target_value"] += child_total["target_value"]
+                total["shop_visit_target"] += child_total["shop_visit_target"]
+            memo[id_no] = total
+            return total
+
+        rows = [
+            {
+                "id_no": e.id_no,
+                "own_target_value": direct_totals[e.id_no]["target_value"],
+                "own_shop_visit_target": direct_totals[e.id_no]["shop_visit_target"],
+                "team_target_value": rollup(e.id_no)["target_value"],
+                "team_shop_visit_target": rollup(e.id_no)["shop_visit_target"],
+            }
+            for e in people
+        ]
+        return Response(rows)
+
 
 class ShopViewSet(ImportExportMixin, BaseViewSet):
     module = "shops"
@@ -276,7 +336,11 @@ class ShopViewSet(ImportExportMixin, BaseViewSet):
     generate_id = staticmethod(next_shop_code)
 
     def get_queryset(self):
-        return visibility.scope_by_email(super().get_queryset(), self.request.user, "srEmail")
+        # Accountant isn't part of the sales hierarchy (no downline), but
+        # needs company-wide outlet visibility for receivables (Shop.due).
+        return visibility.scope_by_email(
+            super().get_queryset(), self.request.user, "srEmail", full_roles={"Manager", "Accountant"}
+        )
 
 
 class SalesOrderViewSet(ImportExportMixin, BaseViewSet):
@@ -289,7 +353,11 @@ class SalesOrderViewSet(ImportExportMixin, BaseViewSet):
     spec = SALES_ORDER_SPEC
 
     def get_queryset(self):
-        return visibility.scope_by_email(super().get_queryset(), self.request.user, "srEmail")
+        # Accountant needs every sale for financial reports (income), not
+        # just a downline's — they aren't part of the sales hierarchy at all.
+        return visibility.scope_by_email(
+            super().get_queryset(), self.request.user, "srEmail", full_roles={"Manager", "Accountant"}
+        )
 
 
 class OfferViewSet(ImportExportMixin, BaseViewSet):
@@ -313,7 +381,11 @@ class OfferAccrualViewSet(BaseViewSet):
     ordering_fields = ["shop", "accrued", "purchases"]
 
     def get_queryset(self):
-        return visibility.scope_by_shop(super().get_queryset(), self.request.user)
+        # Offer liability (unpaid cashback/reward accruals) is a financial
+        # figure Accountant needs company-wide for financial reports.
+        return visibility.scope_by_shop(
+            super().get_queryset(), self.request.user, full_roles={"Manager", "Accountant"}
+        )
 
 
 class DamageRecordViewSet(BaseViewSet):
@@ -368,6 +440,47 @@ class AttendanceViewSet(ImportExportMixin, BaseViewSet):
             super().get_queryset(), self.request.user, "email", full_roles={"Manager", "HR"}
         )
 
+    @action(detail=False, methods=["post"], url_path="check-in")
+    def check_in(self, request):
+        """Self check-in. The punch time and date are ALWAYS the server's own
+        clock — never trust a date/time value from the request body — so
+        changing a phone's clock can't backdate a punch into "on time" or
+        fabricate a day that wasn't actually worked. (Before this action
+        existed, the frontend computed the time client-side and PATCHed it
+        straight through, which the server's "recompute status" logic then
+        happily evaluated against — recomputing Present/Late from a client-
+        controlled time is no safer than trusting the client's status.)
+        """
+        user = request.user
+        now_local = timezone.localtime(timezone.now())
+        date_str = now_local.strftime("%Y-%m-%d")
+        time_str = now_local.strftime("%H:%M")
+        row = Attendance.objects.filter(email=user.email, date=date_str).first()
+        if row and row.check_in:
+            return Response({"detail": "Already checked in today."}, status=status.HTTP_400_BAD_REQUEST)
+        data = {"id": user.id_no, "name": user.name, "email": user.email, "date": date_str, "in": time_str}
+        serializer = AttendanceSerializer(row, data=data, partial=True, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_200_OK if row else status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["post"], url_path="check-out")
+    def check_out(self, request):
+        """Self check-out — same server-clock rule as check-in above."""
+        user = request.user
+        now_local = timezone.localtime(timezone.now())
+        date_str = now_local.strftime("%Y-%m-%d")
+        time_str = now_local.strftime("%H:%M")
+        row = Attendance.objects.filter(email=user.email, date=date_str).first()
+        if not row or not row.check_in:
+            return Response({"detail": "Check in before checking out."}, status=status.HTTP_400_BAD_REQUEST)
+        if row.check_out:
+            return Response({"detail": "Already checked out today."}, status=status.HTTP_400_BAD_REQUEST)
+        serializer = AttendanceSerializer(row, data={"out": time_str}, partial=True, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
 
 class LedgerEntryViewSet(BaseViewSet):
     module = "accounting"
@@ -380,10 +493,10 @@ class LedgerEntryViewSet(BaseViewSet):
     def get_queryset(self):
         # The general ledger has no person field at all, and no sales-floor
         # role has ever had any access to it (write or otherwise) — it's
-        # Manager/Administrative only, full stop, not downline-scoped.
+        # Manager/Administrative/Accountant only, full stop, not downline-scoped.
         qs = super().get_queryset()
         user = self.request.user
-        if not user or not user.is_authenticated or user.role not in {"Manager", "Administrative"}:
+        if not user or not user.is_authenticated or user.role not in {"Manager", "Administrative", "Accountant"}:
             return qs.none()
         return qs
 
@@ -413,7 +526,9 @@ class PaymentViewSet(ImportExportMixin, BaseViewSet):
     spec = PAYMENT_SPEC
 
     def get_queryset(self):
-        return visibility.scope_by_shop(super().get_queryset(), self.request.user, full_roles={"Manager", "Administrative"})
+        return visibility.scope_by_shop(
+            super().get_queryset(), self.request.user, full_roles={"Manager", "Administrative", "Accountant"}
+        )
 
 
 class CashbackTxnViewSet(ImportExportMixin, BaseViewSet):
@@ -426,7 +541,9 @@ class CashbackTxnViewSet(ImportExportMixin, BaseViewSet):
     spec = CASHBACK_SPEC
 
     def get_queryset(self):
-        return visibility.scope_by_shop(super().get_queryset(), self.request.user, full_roles={"Manager", "Administrative"})
+        return visibility.scope_by_shop(
+            super().get_queryset(), self.request.user, full_roles={"Manager", "Administrative", "Accountant"}
+        )
 
 
 class PayoutViewSet(BaseViewSet):
@@ -440,7 +557,9 @@ class PayoutViewSet(BaseViewSet):
     ordering_fields = ["date", "amount", "id"]
 
     def get_queryset(self):
-        return visibility.scope_by_shop(super().get_queryset(), self.request.user, full_roles={"Manager", "Administrative"})
+        return visibility.scope_by_shop(
+            super().get_queryset(), self.request.user, full_roles={"Manager", "Administrative", "Accountant"}
+        )
 
 
 class ShopReviewViewSet(BaseViewSet):
@@ -661,7 +780,7 @@ def public_invoice(request, invoice_id):
                 "deliveredDate": order.deliveredDate,
                 "offer": order.offer,
                 "lines": [
-                    {"sku": l.sku, "name": l.name, "qty": l.qty, "price": l.price}
+                    {"sku": l.sku, "name": l.name, "qty": l.qty, "price": l.price, "unit_type": l.unit_type}
                     for l in order.lines.all()
                 ],
             },
@@ -755,7 +874,17 @@ class EmployeeViewSet(ImportExportMixin, BaseViewSet):
         your downline" picker and the hierarchy-scoped attendance/dashboard
         views on the frontend — read-only, open to any authenticated user."""
         rows = [
-            {"id_no": e.id_no, "name": e.name, "email": e.email, "designation": e.designation}
+            {
+                "id_no": e.id_no,
+                "name": e.name,
+                "email": e.email,
+                "designation": e.designation,
+                # Who this team member reports to, within the downline tree
+                # (the signed-in user's own id_no for direct reports). Lets
+                # the frontend group "my ASMs" vs "each ASM's own downline"
+                # for a drill-down team view instead of one flat list.
+                "reports_to": e.reports_to_id,
+            }
             for e in request.user.downline()
             if e.status != "Pending"
         ]

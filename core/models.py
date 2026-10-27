@@ -320,6 +320,13 @@ class InvoiceLine(models.Model):
     name = models.CharField(max_length=200)
     qty = models.IntegerField(default=0)
     price = models.DecimalField(**MONEY, default=0)
+    # PCS | Carton — snapshotted from the product at sale time (same reasoning
+    # as DamageRecord.unit_type/StockEntry.unit_type) so the invoice always
+    # prints "2 ctn" vs "2 pcs" correctly, even if the product's own
+    # unit_type is changed or the product is deleted later. Blank on invoices
+    # created before this field existed — display falls back to looking the
+    # product up live for those.
+    unit_type = models.CharField(max_length=10, blank=True, default="")
 
     def __str__(self):
         return f"{self.order_id}: {self.name} x{self.qty}"
@@ -749,6 +756,7 @@ class Employee(AbstractBaseUser, PermissionsMixin):
         ("FSE", "Field Sales Executive"),
         ("Support Staff", "Support Staff"),
         ("Administrative", "Administrative"),
+        ("Accountant", "Accountant"),
         ("HR", "HR & Admin"),
     ]
 

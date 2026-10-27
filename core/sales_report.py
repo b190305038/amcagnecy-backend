@@ -24,9 +24,13 @@ BASE_HEADERS = [
     "ASE Name", "ASE Code", "Dealer Code", "Dealer Name", "Contact Number", "Address",
 ]
 
-HEADER_FILL = PatternFill("solid", fgColor="1F3A5F")
-GROUP_FILL = PatternFill("solid", fgColor="2E5B8A")
-PRODUCT_FILL = PatternFill("solid", fgColor="3E76AC")
+# openpyxl's Color needs a full 8-digit ARGB hex string; a bare 6-digit
+# "rrggbb" gets an implicit "00" (fully transparent) alpha prefix rather than
+# "ff" (opaque) — the fill is technically written to the file, just invisible
+# once opened in Excel. "ff" makes it actually show.
+HEADER_FILL = PatternFill("solid", fgColor="FF1F3A5F")
+GROUP_FILL = PatternFill("solid", fgColor="FF2E5B8A")
+PRODUCT_FILL = PatternFill("solid", fgColor="FF3E76AC")
 
 
 def _period_bounds(as_of: date) -> tuple[str, str, str]:
@@ -79,10 +83,17 @@ def build_report(as_of: date, *, region: str = "", area: str = "", territory: st
 
     lines = InvoiceLine.objects.filter(
         order__date__gte=year_start, order__date__lte=as_of_iso
-    ).values("sku", "qty", "price", "order__shop", "order__date")
+    ).values("sku", "qty", "price", "order__shop", "order__date", "order__sr")
 
     # dealer_code -> sku -> {mtd_qty, mtd_val, ytd_qty, ytd_val}
     agg: dict = defaultdict(lambda: defaultdict(lambda: {"mtd_qty": 0.0, "mtd_val": 0.0, "ytd_qty": 0.0, "ytd_val": 0.0}))
+    # dealer_code -> (latest order date seen, that order's "sr") — who is
+    # ACTUALLY recording sales for this dealer right now, not just who the
+    # dealer happens to have on file as its assigned ASE (Dealer.ase, a
+    # static admin assignment that's easy to forget to update — a brand-new
+    # employee who starts taking orders for this dealer would otherwise never
+    # show up here until someone manually reassigns it).
+    latest_sr: dict = {}
     for row in lines:
         dealer_code = shop_dealer.get(row["order__shop"])
         if not dealer_code:
@@ -95,6 +106,9 @@ def build_report(as_of: date, *, region: str = "", area: str = "", territory: st
         if row["order__date"] >= month_start:
             bucket["mtd_qty"] += qty
             bucket["mtd_val"] += value
+        prev = latest_sr.get(dealer_code)
+        if row["order__sr"] and (prev is None or row["order__date"] >= prev[0]):
+            latest_sr[dealer_code] = (row["order__date"], row["order__sr"])
 
     area_codes = _area_codes()
     territory_codes = _territory_codes()
@@ -120,7 +134,10 @@ def build_report(as_of: date, *, region: str = "", area: str = "", territory: st
             "areaCode": area_codes.get(dealer.area, ""),
             "territory": dealer.territory,
             "territoryCode": territory_codes.get((dealer.area, dealer.territory), ""),
-            "aseName": dealer.ase.name if dealer.ase else "",
+            # Prefer whoever actually recorded a sale for this dealer within
+            # the report period; fall back to the static assignment only when
+            # there's no sale yet to read it from.
+            "aseName": (latest_sr.get(dealer.code) or (None, None))[1] or (dealer.ase.name if dealer.ase else ""),
             "aseCode": dealer.ase_id or "",
             "dealerCode": dealer.code,
             "dealerName": dealer.name,

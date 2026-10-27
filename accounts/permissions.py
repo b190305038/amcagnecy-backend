@@ -63,6 +63,15 @@ PERMS = {
     # reachable because Reports is a read-only module — reads are always
     # open, see RoleModulePermission.has_permission.)
     "Administrative": {"write": ["accounting", "payments"], "delete": ["accounting"]},
+    # Accountant: income/expense/payments/receivables/payables bookkeeping —
+    # the same direct write scope as Administrative (ledger + collecting
+    # payments). Sales/purchases/financial-reports visibility is read-only
+    # (reads are always open) and company-wide rather than downline-scoped —
+    # see the full_roles={"Manager", "Accountant"} overrides on
+    # SalesOrderViewSet/ShopViewSet/LedgerEntryViewSet/PaymentViewSet/
+    # CashbackTxnViewSet/PayoutViewSet/OfferAccrualViewSet in core/views.py.
+    # Deliberately NOT Super Admin — no HR, Settings, or sales-floor writes.
+    "Accountant": {"write": ["accounting", "payments"], "delete": ["accounting"]},
     # HR & Admin: Employee Directory + Attendance only.
     "HR": {"write": ["hr", "attendance"], "delete": ["hr"]},
 }

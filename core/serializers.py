@@ -80,7 +80,7 @@ class ShopSerializer(serializers.ModelSerializer):
 class InvoiceLineSerializer(serializers.ModelSerializer):
     class Meta:
         model = InvoiceLine
-        fields = ["sku", "name", "qty", "price"]
+        fields = ["sku", "name", "qty", "price", "unit_type"]
 
 
 class SalesOrderSerializer(serializers.ModelSerializer):
@@ -605,6 +605,20 @@ class EmployeeSerializer(serializers.ModelSerializer):
         for field in self._SENSITIVE_FIELDS:
             data.pop(field, None)
         return data
+
+    def to_internal_value(self, data):
+        # date_of_birth is optional (null=True, blank=True on the model), but
+        # DRF's DateField only special-cases "" for CharField/allow_blank — an
+        # empty string sent for a blank-left optional date fails format
+        # validation outright ("Date has wrong format") instead of being
+        # treated as "not provided". Every employee create from the frontend
+        # sends "" here whenever DOB is skipped (the normal case), so without
+        # this this endpoint 400s on essentially every onboarding.
+        if hasattr(data, "copy"):
+            data = data.copy()
+            if data.get("date_of_birth", None) == "":
+                data["date_of_birth"] = None
+        return super().to_internal_value(data)
 
     def validate(self, attrs):
         # Every employee needs a login, so both are required on create. On
